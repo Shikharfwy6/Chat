@@ -8,9 +8,9 @@ from pymongo import MongoClient
 
 # --- CONFIGURATION (Reading from Environment Variables) ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0")) # ID integer honi chahiye
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))  # ID integer honi chahiye
 MONGO_URI = os.environ.get("MONGO_URI")
-VERCEL_URL = os.environ.get("VERCEL_URL") # Vercel ise automatic bhi deta hai
+VERCEL_URL = os.environ.get("VERCEL_URL")
 # ---------------------------------------------------------
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -23,7 +23,7 @@ client = MongoClient(MONGO_URI)
 db = client['telegram_forward_bot']
 messages_col = db['messages']
 
-# Telegram Application Setup
+# Telegram Application Setup (Bina run_polling ke)
 application = Application.builder().token(BOT_TOKEN).build()
 
 async def handle_incoming_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -50,6 +50,7 @@ async def handle_incoming_messages(update: Update, context: ContextTypes.DEFAULT
 
         if sent_message:
             messages_col.insert_one({"channel_msg_id": sent_message.message_id, "user_id": user.id})
+            print(f"Stored in DB: Channel Msg {sent_message.message_id} -> User {user.id}")
     except Exception as e:
         print(f"Error forwarding: {e}")
 
@@ -71,25 +72,34 @@ async def handle_channel_replies(update: Update, context: ContextTypes.DEFAULT_T
                 await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=admin_caption, parse_mode="HTML")
             elif msg.text:
                 await context.bot.send_message(chat_id=user_id, text=f"💬 **Admin Reply:**\n\n{msg.text}", parse_mode="HTML")
+            print(f"✅ Reply successfully sent to user: {user_id}")
         except Exception as e:
             print(f"Error replying: {e}")
 
-# Handlers
+# Handlers register karein
 application.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.TEXT | filters.PHOTO), handle_incoming_messages))
 application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & (filters.TEXT | filters.PHOTO), handle_channel_replies))
 
+# --- FLASK ROUTES ---
+
 @app.route('/')
 def home():
-    return "Bot is running 24/7 safely with Environment Variables!"
+    return "Bot is running 24/7 safely with Environment Variables on Vercel!"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
     if request.method == "POST":
         try:
             update = Update.de_json(request.get_json(force=True), application.bot)
+            
             import asyncio
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            
+            # [FIX] Vercel initialization error ko theek karne ke liye
+            if not application.initialized:
+                loop.run_until_complete(application.initialize())
+                
             loop.run_until_complete(application.process_update(update))
             loop.close()
         except Exception as e:
@@ -102,10 +112,12 @@ def setup():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
-    # Agar aapne VERCEL_URL env mein nahi dala, toh vercel khud se project URL utha leta hai
+    if not application.initialized:
+        loop.run_until_complete(application.initialize())
+        
     url_to_use = VERCEL_URL if VERCEL_URL else f"https://{os.environ.get('VERCEL_PROJECT_PRODUCTION_URL')}"
-    
     webhook_url = f"{url_to_use}/webhook"
+    
     success = loop.run_until_complete(application.bot.set_webhook(url=webhook_url))
     loop.close()
     if success:
@@ -114,4 +126,3 @@ def setup():
 
 if __name__ == '__main__':
     app.run(debug=True)
-          
