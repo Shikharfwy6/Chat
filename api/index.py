@@ -1,21 +1,21 @@
 import logging
 import re
 import os
+import asyncio
 from flask import Flask, request
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from pymongo import MongoClient
 
-# --- CONFIGURATION (Reading from Environment Variables) ---
+# --- CONFIGURATION ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))  # ID integer honi chahiye
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
 MONGO_URI = os.environ.get("MONGO_URI")
 VERCEL_URL = os.environ.get("VERCEL_URL")
-# ---------------------------------------------------------
+# ---------------------
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# Flask App Initialize
 app = Flask(__name__)
 
 # MongoDB Setup
@@ -23,11 +23,21 @@ client = MongoClient(MONGO_URI)
 db = client['telegram_forward_bot']
 messages_col = db['messages']
 
-# Telegram Application Setup (Bina run_polling ke)
+# Telegram Application Setup
 application = Application.builder().token(BOT_TOKEN).build()
 
+# Global flag initialization ko track karne ke liye
+APP_INITIALIZED = False
+
+async def init_application():
+    """Application ko safely initialize aur start karne ke liye"""
+    global APP_INITIALIZED
+    if not APP_INITIALIZED:
+        await application.initialize()
+        await application.start()
+        APP_INITIALIZED = True
+
 async def handle_incoming_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User ke Message/Image ko Channel mein bhejne ke liye"""
     if update.effective_chat.id == CHANNEL_ID:
         return
 
@@ -50,12 +60,10 @@ async def handle_incoming_messages(update: Update, context: ContextTypes.DEFAULT
 
         if sent_message:
             messages_col.insert_one({"channel_msg_id": sent_message.message_id, "user_id": user.id})
-            print(f"Stored in DB: Channel Msg {sent_message.message_id} -> User {user.id}")
     except Exception as e:
         print(f"Error forwarding: {e}")
 
 async def handle_channel_replies(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Channel mein direct reply ko handle karne ke liye"""
     msg = update.channel_post if update.channel_post else update.message
     if not msg or not msg.reply_to_message:
         return
@@ -72,11 +80,10 @@ async def handle_channel_replies(update: Update, context: ContextTypes.DEFAULT_T
                 await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=admin_caption, parse_mode="HTML")
             elif msg.text:
                 await context.bot.send_message(chat_id=user_id, text=f"💬 **Admin Reply:**\n\n{msg.text}", parse_mode="HTML")
-            print(f"✅ Reply successfully sent to user: {user_id}")
         except Exception as e:
             print(f"Error replying: {e}")
 
-# Handlers register karein
+# Handlers
 application.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.TEXT | filters.PHOTO), handle_incoming_messages))
 application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & (filters.TEXT | filters.PHOTO), handle_channel_replies))
 
@@ -84,7 +91,7 @@ application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & (filter
 
 @app.route('/')
 def home():
-    return "Bot is running 24/7 safely with Environment Variables on Vercel!"
+    return "Bot is running 24/7 on Vercel with fix!"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -92,14 +99,11 @@ def webhook():
         try:
             update = Update.de_json(request.get_json(force=True), application.bot)
             
-            import asyncio
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             
-            # [FIX] Vercel initialization error ko theek karne ke liye
-            if not application.initialized:
-                loop.run_until_complete(application.initialize())
-                
+            # [FIXED] Custom function se safely initialize karein
+            loop.run_until_complete(init_application())
             loop.run_until_complete(application.process_update(update))
             loop.close()
         except Exception as e:
@@ -108,12 +112,10 @@ def webhook():
 
 @app.route('/setup')
 def setup():
-    import asyncio
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
-    if not application.initialized:
-        loop.run_until_complete(application.initialize())
+    loop.run_until_complete(init_application())
         
     url_to_use = VERCEL_URL if VERCEL_URL else f"https://{os.environ.get('VERCEL_PROJECT_PRODUCTION_URL')}"
     webhook_url = f"{url_to_use}/webhook"
