@@ -26,11 +26,9 @@ messages_col = db['messages']
 # Telegram Application Setup
 application = Application.builder().token(BOT_TOKEN).build()
 
-# Global flag initialization ko track karne ke liye
 APP_INITIALIZED = False
 
 async def init_application():
-    """Application ko safely initialize aur start karne ke liye"""
     global APP_INITIALIZED
     if not APP_INITIALIZED:
         await application.initialize()
@@ -38,6 +36,7 @@ async def init_application():
         APP_INITIALIZED = True
 
 async def handle_incoming_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User ke Message ko Channel mein bhejne ke liye"""
     if update.effective_chat.id == CHANNEL_ID:
         return
 
@@ -60,15 +59,20 @@ async def handle_incoming_messages(update: Update, context: ContextTypes.DEFAULT
 
         if sent_message:
             messages_col.insert_one({"channel_msg_id": sent_message.message_id, "user_id": user.id})
+            print(f"✅ Stored in DB: Channel Msg {sent_message.message_id} -> User {user.id}")
     except Exception as e:
         print(f"Error forwarding: {e}")
 
 async def handle_channel_replies(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Channel ke andar direct reply handle karne ke liye"""
+    # [CRUCIAL] Channel post ko sahi se pakadna
     msg = update.channel_post if update.channel_post else update.message
     if not msg or not msg.reply_to_message:
         return
 
     reply_to_msg = msg.reply_to_message
+    
+    # DB se user dhoondna
     record = messages_col.find_one({"channel_msg_id": reply_to_msg.message_id})
 
     if record:
@@ -80,18 +84,19 @@ async def handle_channel_replies(update: Update, context: ContextTypes.DEFAULT_T
                 await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=admin_caption, parse_mode="HTML")
             elif msg.text:
                 await context.bot.send_message(chat_id=user_id, text=f"💬 **Admin Reply:**\n\n{msg.text}", parse_mode="HTML")
+            print(f"✅ Reply successfully sent to user: {user_id}")
         except Exception as e:
             print(f"Error replying: {e}")
+    else:
+        print(f"⚠️ Memory/DB mein is message ki ID nahi mili.")
 
-# Handlers
+# Handlers (Donom me text aur photo filter active hain)
 application.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.TEXT | filters.PHOTO), handle_incoming_messages))
 application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & (filters.TEXT | filters.PHOTO), handle_channel_replies))
 
-# --- FLASK ROUTES ---
-
 @app.route('/')
 def home():
-    return "Bot is running 24/7 on Vercel with fix!"
+    return "Bot is running 24/7 on Vercel!"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -102,7 +107,6 @@ def webhook():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             
-            # [FIXED] Custom function se safely initialize karein
             loop.run_until_complete(init_application())
             loop.run_until_complete(application.process_update(update))
             loop.close()
@@ -120,10 +124,14 @@ def setup():
     url_to_use = VERCEL_URL if VERCEL_URL else f"https://{os.environ.get('VERCEL_PROJECT_PRODUCTION_URL')}"
     webhook_url = f"{url_to_use}/webhook"
     
-    success = loop.run_until_complete(application.bot.set_webhook(url=webhook_url))
+    # [ZARURI]: Telegram ko batana ki channel_post ki updates bhi bhejni hain webhook par
+    success = loop.run_until_complete(application.bot.set_webhook(
+        url=webhook_url, 
+        allowed_updates=["message", "channel_post", "edited_channel_post"]
+    ))
     loop.close()
     if success:
-        return f"✅ Webhook successfully set to {webhook_url}"
+        return f"✅ Webhook successfully set with channel support to {webhook_url}"
     return "❌ Failed to set webhook"
 
 if __name__ == '__main__':
