@@ -1,10 +1,8 @@
 import logging
-import re
 import os
 import asyncio
 from flask import Flask, request
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram import Update, Bot
 from pymongo import MongoClient
 
 # --- CONFIGURATION ---
@@ -23,88 +21,83 @@ client = MongoClient(MONGO_URI)
 db = client['telegram_forward_bot']
 messages_col = db['messages']
 
-# Telegram Application Setup
-application = Application.builder().token(BOT_TOKEN).build()
+# Direct Telegram Bot Client
+bot = Bot(token=BOT_TOKEN)
 
-# Global flag initialization ko track karne ke liye
-APP_INITIALIZED = False
-
-async def init_application():
-    """Application ko safely initialize aur start karne ke liye"""
-    global APP_INITIALIZED
-    if not APP_INITIALIZED:
-        await application.initialize()
-        await application.start()
-        APP_INITIALIZED = True
-
-async def handle_incoming_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id == CHANNEL_ID:
-        return
-
-    user = update.effective_user
-    msg = update.message
-    caption_text = f"📩 **New Message from {user.mention_html()}**:\n👤 UserID: `{user.id}`"
-    sent_message = None
-
-    try:
-        if msg.photo:
-            file_id = msg.photo[-1].file_id
-            user_caption = f"\n\n📝 Caption: {msg.caption}" if msg.caption else ""
-            sent_message = await context.bot.send_photo(
-                chat_id=CHANNEL_ID, photo=file_id, caption=caption_text + user_caption, parse_mode="HTML"
-            )
-        elif msg.text:
-            sent_message = await context.bot.send_message(
-                chat_id=CHANNEL_ID, text=f"{caption_text}\n\n💬 Message:\n{msg.text}", parse_mode="HTML"
-            )
-
-        if sent_message:
-            messages_col.insert_one({"channel_msg_id": sent_message.message_id, "user_id": user.id})
-    except Exception as e:
-        print(f"Error forwarding: {e}")
-
-async def handle_channel_replies(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.channel_post if update.channel_post else update.message
-    if not msg or not msg.reply_to_message:
-        return
-
-    reply_to_msg = msg.reply_to_message
-    record = messages_col.find_one({"channel_msg_id": reply_to_msg.message_id})
-
-    if record:
-        user_id = record["user_id"]
+async def process_telegram_update(update_json):
+    """Sare incoming messages aur channel replies ko direct handle karne ke liye"""
+    
+    # 1. USER SE BOT PAR MESSAGE AANA (Private Chat)
+    if "message" in update_json and update_json["message"]["chat"]["type"] == "private":
+        msg = update_json["message"]
+        user_id = msg["from"]["id"]
+        first_name = msg["from"].get("first_name", "User")
+        
+        # User ka mention HTML format mein
+        user_mention = f'<a href="tg://user?id={user_id}">{first_name}</a>'
+        caption_text = f"📩 **New Message from {user_mention}**:\n👤 UserID: `{user_id}`"
+        
+        sent_msg = None
         try:
-            if msg.photo:
-                file_id = msg.photo[-1].file_id
-                admin_caption = f"💬 **Admin Reply:**\n\n{msg.caption}" if msg.caption else "💬 **Admin Reply (Photo)**"
-                await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=admin_caption, parse_mode="HTML")
-            elif msg.text:
-                await context.bot.send_message(chat_id=user_id, text=f"💬 **Admin Reply:**\n\n{msg.text}", parse_mode="HTML")
+            if "photo" in msg:
+                file_id = msg["photo"][-1]["file_id"]  # Best quality photo
+                user_caption = f"\n\n📝 Caption: {msg['caption']}" if "caption" in msg else ""
+                sent_msg = await bot.send_photo(
+                    chat_id=CHANNEL_ID, photo=file_id, caption=caption_text + user_caption, parse_mode="HTML"
+                )
+            elif "text" in msg:
+                text_to_send = f"{caption_text}\n\n💬 Message:\n{msg['text']}"
+                sent_msg = await bot.send_message(chat_id=CHANNEL_ID, text=text_to_send, parse_mode="HTML")
+            
+            # MongoDB mein record save karna
+            if sent_msg:
+                messages_col.insert_one({"channel_msg_id": sent_msg.message_id, "user_id": user_id})
+                print(f"✅ Stored in DB: Channel Msg {sent_msg.message_id} -> User {user_id}")
         except Exception as e:
-            print(f"Error replying: {e}")
+            print(f"Error forwarding to channel: {e}")
 
-# Handlers
-application.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.TEXT | filters.PHOTO), handle_incoming_messages))
-application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & (filters.TEXT | filters.PHOTO), handle_channel_replies))
+    # 2. CHANNEL MEIN RE-PLY KARNA (Channel Post)
+    elif "channel_post" in update_json:
+        post = update_json["channel_post"]
+        
+        # Check karein ki kya ye kisi post ka reply hai
+        if "reply_to_message" in post:
+            reply_to_msg_id = post["reply_to_message"]["message_id"]
+            
+            # DB se check karein ki ye kis user ka message tha
+            record = messages_col.find_one({"channel_msg_id": reply_to_msg_id})
+            
+            if record:
+                user_id = record["user_id"]
+                try:
+                    if "photo" in post:
+                        file_id = post["photo"][-1]["file_id"]
+                        admin_caption = f"💬 **Admin Reply:**\n\n{post['caption']}" if "caption" in post else "💬 **Admin Reply (Photo)**"
+                        await bot.send_photo(chat_id=user_id, photo=file_id, caption=admin_caption, parse_mode="HTML")
+                    elif "text" in post:
+                        await bot.send_message(chat_id=user_id, text=f"💬 **Admin Reply:**\n\n{post['text']}", parse_mode="HTML")
+                    print(f"✅ Reply sent to user: {user_id}")
+                except Exception as e:
+                    print(f"Error sending reply to user: {e}")
+            else:
+                print(f"⚠️ Memory/DB mein is message ID ({reply_to_msg_id}) ki entry nahi mili.")
 
 # --- FLASK ROUTES ---
 
 @app.route('/')
 def home():
-    return "Bot is running 24/7 on Vercel with fix!"
+    return "Bot is running 24/7 with raw webhook processor on Vercel!"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
     if request.method == "POST":
         try:
-            update = Update.de_json(request.get_json(force=True), application.bot)
+            update_json = request.get_json(force=True)
             
+            # Async function ko chalane ke liye loop setup
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            
-            # [FIXED] Custom function se safely initialize karein
-            loop.run_until_complete(init_application())
-            loop.run_until_complete(application.process_update(update))
+            loop.run_until_complete(process_telegram_update(update_json))
             loop.close()
         except Exception as e:
             print(f"Webhook Error: {e}")
@@ -115,13 +108,16 @@ def setup():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
-    loop.run_until_complete(init_application())
-        
     url_to_use = VERCEL_URL if VERCEL_URL else f"https://{os.environ.get('VERCEL_PROJECT_PRODUCTION_URL')}"
     webhook_url = f"{url_to_use}/webhook"
     
-    success = loop.run_until_complete(application.bot.set_webhook(url=webhook_url))
+    # Telegram ko explicitly batana ki message aur channel_post dono bhejni hain
+    success = loop.run_until_complete(bot.set_webhook(
+        url=webhook_url,
+        allowed_updates=["message", "channel_post"]
+    ))
     loop.close()
+    
     if success:
         return f"✅ Webhook successfully set to {webhook_url}"
     return "❌ Failed to set webhook"
